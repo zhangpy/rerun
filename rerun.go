@@ -9,26 +9,51 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/howeyc/fsnotify"
 	"go/build"
 	"log"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"time"
+
+	"github.com/howeyc/fsnotify"
 )
 
 var (
-	do_tests      = flag.Bool("test", false, "Run tests (before running program)")
-	do_build      = flag.Bool("build", false, "Build program")
-	never_run     = flag.Bool("no-run", false, "Do not run")
-	race_detector = flag.Bool("race", false, "Run program and tests with the race detector")
+	doTests      bool
+	doBuild      bool
+	neverRun     bool
+	raceDetector bool
+	buildTags    string
 )
+
+func main() {
+
+	flag.BoolVar(&doTests, "test", false, "Run tests (before running program)")
+	flag.BoolVar(&doBuild, "build", false, "Build program")
+	flag.StringVar(&buildTags, "build-tags", "", "Build tags")
+	flag.BoolVar(&neverRun, "no-run", false, "Do not run")
+	flag.BoolVar(&raceDetector, "race", false, "Run program and tests with the race detector")
+
+	flag.Parse()
+
+	if len(flag.Args()) < 1 {
+		log.Fatal("Usage: rerun [--test] [--no-run] [--build] [--race] <import path> [arg]*")
+	}
+
+	buildpath := flag.Args()[0]
+	args := flag.Args()[1:]
+	err := rerun(buildpath, args)
+	if err != nil {
+		logln(err)
+	}
+}
 
 func install(buildpath, lastError string) (installed bool, errorOutput string, err error) {
 	cmdline := []string{"go", "get"}
 
-	if *race_detector {
+	if raceDetector {
 		cmdline = append(cmdline, "-race")
 	}
 	cmdline = append(cmdline, buildpath)
@@ -52,14 +77,13 @@ func install(buildpath, lastError string) (installed bool, errorOutput string, e
 	}
 
 	// all seems fine
-	installed = true
 	return
 }
 
 func test(buildpath string) (passed bool, err error) {
 	cmdline := []string{"go", "test"}
 
-	if *race_detector {
+	if raceDetector {
 		cmdline = append(cmdline, "-race")
 	}
 	cmdline = append(cmdline, "-v", buildpath)
@@ -76,7 +100,7 @@ func test(buildpath string) (passed bool, err error) {
 	if !passed {
 		fmt.Println(buf)
 	} else {
-		log.Println("tests passed")
+		logln("tests passed")
 	}
 
 	return
@@ -85,7 +109,11 @@ func test(buildpath string) (passed bool, err error) {
 func gobuild(buildpath string) (passed bool, err error) {
 	cmdline := []string{"go", "build"}
 
-	if *race_detector {
+	if buildTags != "" {
+		cmdline = append(cmdline, "-tags", buildTags)
+	}
+
+	if raceDetector {
 		cmdline = append(cmdline, "-race")
 	}
 	cmdline = append(cmdline, "-v", buildpath)
@@ -102,41 +130,61 @@ func gobuild(buildpath string) (passed bool, err error) {
 	if !passed {
 		fmt.Println(buf)
 	} else {
-		log.Println("build passed")
+		logln("build passed")
 	}
 
 	return
 }
 
-func run(binName, binPath string, args []string) (runch chan bool) {
-	runch = make(chan bool)
+var runch = make(chan bool)
+
+func run(binName, binPath string, args []string) {
+	cmdline := append([]string{binName}, args...)
+	var proc *os.Process
+	restarting := false
 	go func() {
-		cmdline := append([]string{binName}, args...)
-		var proc *os.Process
-		for relaunch := range runch {
-			if proc != nil {
-				err := proc.Signal(os.Interrupt)
-				if err != nil {
-					log.Printf("error on sending signal to process: '%s', will now hard-kill the process\n", err)
-					proc.Kill()
-				}
-				proc.Wait()
-			}
-			if !relaunch {
+		for {
+			time.Sleep(time.Second)
+			if restarting {
 				continue
 			}
-			cmd := exec.Command(binPath, args...)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			log.Print(cmdline)
-			err := cmd.Start()
-			if err != nil {
-				log.Printf("error on starting process: '%s'\n", err)
+			if proc == nil {
+				logln("process quit, relauch")
+				runch <- true
+				continue
 			}
-			proc = cmd.Process
+			ps, err := proc.Wait()
+			if err != nil {
+				logln("000", err, ps)
+			}
+			proc = nil
 		}
 	}()
-	return
+	for relaunch := range runch {
+		logln("launch", binPath)
+		restarting = true
+		defer func() { restarting = false }()
+		if proc != nil {
+			err := proc.Signal(os.Interrupt)
+			if err != nil {
+				logf("error on sending signal to process: '%s', will now hard-kill the process", err)
+				proc.Kill()
+			}
+			proc.Wait()
+		}
+		if !relaunch {
+			continue
+		}
+		cmd := exec.Command(binPath, args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		log.Print(cmdline)
+		err := cmd.Start()
+		if err != nil {
+			logf("error on starting process: '%s'", err)
+		}
+		proc = cmd.Process
+	}
 }
 
 func getWatcher(buildpath string) (watcher *fsnotify.Watcher, err error) {
@@ -163,16 +211,15 @@ func addToWatcher(watcher *fsnotify.Watcher, importpath string, watching map[str
 }
 
 func rerun(buildpath string, args []string) (err error) {
-	log.Printf("setting up %s %v", buildpath, args)
+	logf("setting up %s %v", buildpath, args)
 
 	pkg, err := build.Import(buildpath, "", 0)
 	if err != nil {
-		return
+		return err
 	}
 
 	if pkg.Name != "main" {
-		err = errors.New(fmt.Sprintf("expected package %q, got %q", "main", pkg.Name))
-		return
+		return fmt.Errorf("expected package %q, got %q", "main", pkg.Name)
 	}
 
 	_, binName := path.Split(buildpath)
@@ -183,33 +230,31 @@ func rerun(buildpath string, args []string) (err error) {
 		binPath = filepath.Join(pkg.BinDir, binName)
 	}
 
-	var runch chan bool
-	if !(*never_run) {
-		runch = run(binName, binPath, args)
+	if !(neverRun) {
+		go run(binName, binPath, args)
 	}
 
-	no_run := false
-	if *do_tests {
+	noRun := false
+	if doTests {
 		passed, _ := test(buildpath)
 		if !passed {
-			no_run = true
+			noRun = true
 		}
 	}
 
-	if *do_build && !no_run {
+	if doBuild && !noRun {
 		gobuild(buildpath)
 	}
 
 	var errorOutput string
 	_, errorOutput, ierr := install(buildpath, errorOutput)
-	if !no_run && !(*never_run) && ierr == nil {
+	if !noRun && !(neverRun) && ierr == nil {
 		runch <- true
 	}
 
-	var watcher *fsnotify.Watcher
-	watcher, err = getWatcher(buildpath)
+	watcher, err := getWatcher(buildpath)
 	if err != nil {
-		return
+		return err
 	}
 
 	for {
@@ -220,18 +265,18 @@ func rerun(buildpath string, args []string) (err error) {
 			continue
 		}
 
-		log.Print(we.Name)
+		logln("change -->", we.Name)
 
 		// close the watcher
 		watcher.Close()
 		// to clean things up: read events from the watcher until events chan is closed.
 		go func(events chan *fsnotify.FileEvent) {
-			for _ = range events {
+			for range events {
 
 			}
 		}(watcher.Event)
 		// create a new watcher
-		log.Println("rescanning")
+		logln("rescanning")
 		watcher, err = getWatcher(buildpath)
 		if err != nil {
 			return
@@ -240,7 +285,7 @@ func rerun(buildpath string, args []string) (err error) {
 		// we don't need the errors from the new watcher.
 		// we continiously discard them from the channel to avoid a deadlock.
 		go func(errors chan error) {
-			for _ = range errors {
+			for range errors {
 
 			}
 		}(watcher.Error)
@@ -252,36 +297,30 @@ func rerun(buildpath string, args []string) (err error) {
 			continue
 		}
 
-		if *do_tests {
+		if doTests {
 			passed, _ := test(buildpath)
 			if !passed {
 				continue
 			}
 		}
 
-		if *do_build {
+		if doBuild {
 			gobuild(buildpath)
 		}
 
 		// rerun. if we're only testing, sending
-		if !(*never_run) {
+		if !(neverRun) {
 			runch <- true
 		}
 	}
-	return
 }
 
-func main() {
-	flag.Parse()
+func logln(v ...interface{}) {
+	var msgs = []interface{}{"[rerun]"}
+	msgs = append(msgs, v...)
+	log.Println(msgs...)
+}
 
-	if len(flag.Args()) < 1 {
-		log.Fatal("Usage: rerun [--test] [--no-run] [--build] [--race] <import path> [arg]*")
-	}
-
-	buildpath := flag.Args()[0]
-	args := flag.Args()[1:]
-	err := rerun(buildpath, args)
-	if err != nil {
-		log.Print(err)
-	}
+func logf(format string, v ...interface{}) {
+	logln(fmt.Sprintf(format, v...))
 }
